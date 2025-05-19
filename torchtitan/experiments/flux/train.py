@@ -68,6 +68,14 @@ class FluxTrainer(Trainer):
         # load components
         model_config = self.train_spec.config[job_config.model.flavor]
 
+        self.val_dataloader = self.train_spec.build_val_dataloader_fn(
+            dp_world_size=self.dataloader.dp_world_size,
+            dp_rank=self.dataloader.dp_rank,
+            tokenizer=None,
+            job_config=job_config,
+            infinite=False,
+        )
+        
         self.autoencoder = load_ae(
             job_config.encoder.autoencoder_path,
             model_config.autoencoder_params,
