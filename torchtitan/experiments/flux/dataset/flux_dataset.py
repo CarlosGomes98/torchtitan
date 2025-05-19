@@ -13,7 +13,7 @@ import numpy as np
 import PIL
 
 import torch
-from datasets import Dataset, load_dataset
+from datasets import Dataset, load_dataset, concatenate_datasets
 from datasets.distributed import split_dataset_by_node
 
 from torch.distributed.checkpoint.stateful import Stateful
@@ -118,8 +118,12 @@ DATASETS = {
         loader=lambda path: load_dataset(path, split="train", streaming=True),
         data_processor=_cc12m_wds_data_processor,
     ),
+    "coco2014_30k": TextToImageDatasetConfig(
+        path="detection-datasets/coco",
+        loader=lambda path: concatenate_datasets([load_dataset(path, split=s, streaming=True) for s in ["train", "val"]]).take(30_000),
+        data_processor=_cc12m_wds_data_processor,
+    ),
 }
-
 
 def _validate_dataset(
     dataset_name: str, dataset_path: Optional[str] = None
