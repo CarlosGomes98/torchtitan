@@ -1,4 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 # All rights reserved.
 #
 # This source code is licensed under the BSD-style license found in the
