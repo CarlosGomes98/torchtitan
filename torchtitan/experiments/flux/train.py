@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
-from typing import Optional
+from typing import Iterator, Optional
 
 import torch
 
@@ -80,74 +80,84 @@ class FluxTrainer(Trainer):
             job_config=job_config,
         )
 
-    def train_step(self, input_dict: dict[str, torch.Tensor], labels: torch.Tensor):
-        # generate t5 and clip embeddings
-        if not self.is_dataset_preprocessed:
-            input_dict["image"] = labels
-            input_dict = self.preprocess_fn(
-                device=self.device,
-                dtype=self._dtype,
-                autoencoder=self.autoencoder,
-                clip_encoder=self.clip_encoder,
-                t5_encoder=self.t5_encoder,
-                batch=input_dict,
+    def train_step(
+        self,
+        data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]],
+        acc_steps: int = 1,
+    ):
+        acc_loss = torch.tensor(0.0, device=self.device)
+        for i in range(acc_steps):
+            # generate t5 and clip embeddings
+            input_dict, labels = self.next_batch(data_iterator)
+            if not self.is_dataset_preprocessed:
+                input_dict["image"] = labels
+                input_dict = self.preprocess_fn(
+                    device=self.device,
+                    dtype=self._dtype,
+                    autoencoder=self.autoencoder,
+                    clip_encoder=self.clip_encoder,
+                    t5_encoder=self.t5_encoder,
+                    batch=input_dict,
+                )
+                labels = input_dict["img_encodings"]
+
+            # Keep these variables local to shorten the code as these are
+            # the major variables that are used in the training loop.
+            model_parts = self.model_parts
+            assert len(self.model_parts) == 1
+            # explicitely convert flux model to be Bfloat16 no matter FSDP is applied or not
+            model = self.model_parts[0]
+
+            if i == acc_steps - 1:
+                model.set_requires_gradient_sync(True)
+
+            world_mesh = self.world_mesh
+            parallel_dims = self.parallel_dims
+
+            # image in latent space transformed by self.auto_encoder
+            clip_encodings = input_dict["clip_encodings"]
+            t5_encodings = input_dict["t5_encodings"]
+
+            bsz = labels.shape[0]
+
+            with torch.no_grad():
+                noise = torch.randn_like(labels)
+                timesteps = torch.rand((bsz,)).to(labels)
+                sigmas = timesteps.view(-1, 1, 1, 1)
+                latents = (1 - sigmas) * labels + sigmas * noise
+
+            bsz, _, latent_height, latent_width = latents.shape
+
+            POSITION_DIM = 3  # constant for Flux flow model
+            with torch.no_grad():
+                # Create positional encodings
+                latent_pos_enc = create_position_encoding_for_latents(
+                    bsz, latent_height, latent_width, POSITION_DIM
+                )
+                text_pos_enc = torch.zeros(bsz, t5_encodings.shape[1], POSITION_DIM)
+
+                # Patchify: Convert latent into a sequence of patches
+                latents = pack_latents(latents)
+
+            latent_noise_pred = model(
+                img=latents,
+                img_ids=latent_pos_enc.to(latents),
+                txt=t5_encodings.to(latents),
+                txt_ids=text_pos_enc.to(latents),
+                y=clip_encodings.to(latents),
+                timesteps=timesteps.to(latents),
             )
-            labels = input_dict["img_encodings"]
 
-        self.optimizers.zero_grad()
-
-        # Keep these variables local to shorten the code as these are
-        # the major variables that are used in the training loop.
-        model_parts = self.model_parts
-        assert len(self.model_parts) == 1
-        # explicitely convert flux model to be Bfloat16 no matter FSDP is applied or not
-        model = self.model_parts[0]
-
-        world_mesh = self.world_mesh
-        parallel_dims = self.parallel_dims
-
-        # image in latent space transformed by self.auto_encoder
-        clip_encodings = input_dict["clip_encodings"]
-        t5_encodings = input_dict["t5_encodings"]
-
-        bsz = labels.shape[0]
-
-        with torch.no_grad():
-            noise = torch.randn_like(labels)
-            timesteps = torch.rand((bsz,)).to(labels)
-            sigmas = timesteps.view(-1, 1, 1, 1)
-            latents = (1 - sigmas) * labels + sigmas * noise
-
-        bsz, _, latent_height, latent_width = latents.shape
-
-        POSITION_DIM = 3  # constant for Flux flow model
-        with torch.no_grad():
-            # Create positional encodings
-            latent_pos_enc = create_position_encoding_for_latents(
-                bsz, latent_height, latent_width, POSITION_DIM
-            )
-            text_pos_enc = torch.zeros(bsz, t5_encodings.shape[1], POSITION_DIM)
-
-            # Patchify: Convert latent into a sequence of patches
-            latents = pack_latents(latents)
-
-        latent_noise_pred = model(
-            img=latents,
-            img_ids=latent_pos_enc.to(latents),
-            txt=t5_encodings.to(latents),
-            txt_ids=text_pos_enc.to(latents),
-            y=clip_encodings.to(latents),
-            timesteps=timesteps.to(latents),
-        )
-
-        # Convert sequence of patches to latent shape
-        pred = unpack_latents(latent_noise_pred, latent_height, latent_width)
-        target = noise - labels
-        loss = self.loss_fn(pred, target)
-        # pred.shape=(bs, seq_len, vocab_size)
-        # need to free to before bwd to avoid peaking memory
-        del (pred, noise, target)
-        loss.backward()
+            # Convert sequence of patches to latent shape
+            pred = unpack_latents(latent_noise_pred, latent_height, latent_width)
+            target = noise - labels
+            loss = self.loss_fn(pred, target)
+            loss = loss / self.job_config.training.accumulate_steps
+            acc_loss += loss.detach()
+            # pred.shape=(bs, seq_len, vocab_size)
+            # need to free to before bwd to avoid peaking memory
+            del (pred, noise, target)
+            loss.backward()
 
         dist_utils.clip_grad_norm_(
             [p for m in model_parts for p in m.parameters()],
@@ -158,6 +168,8 @@ class FluxTrainer(Trainer):
         self.checkpointer.maybe_wait_for_staging()
         self.optimizers.step()
         self.lr_schedulers.step()
+        self.optimizers.zero_grad()
+        model.set_requires_gradient_sync(False)
 
         # log metrics
         if not self.metrics_processor.should_log(self.step):

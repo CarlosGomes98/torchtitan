@@ -13,6 +13,8 @@ class Training:
     """Classifier-free guidance with probability p to dropout the text conditioning"""
     img_size: int = 256
     """Image width to sample"""
+    accumulate_steps: int = 1
+    """Number of gradient accumulation steps"""
 
 
 @dataclass
