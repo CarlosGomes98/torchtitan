@@ -6,9 +6,14 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
-from typing import Iterator, Optional
+import time
+from datetime import timedelta
+from typing import Iterator, Optional, TYPE_CHECKING
 
 import torch
+from torch.distributed.elastic.multiprocessing.errors import record
+
+import torchtitan.components.ft as ft
 
 from torchtitan.config_manager import ConfigManager, JobConfig, TORCH_DTYPE_MAP
 from torchtitan.distributed import utils as dist_utils
@@ -24,6 +29,10 @@ from torchtitan.experiments.flux.utils import (
     unpack_latents,
 )
 from torchtitan.tools.logging import init_logger, logger
+from torchtitan.tools.profiling import (
+    maybe_enable_memory_snapshot,
+    maybe_enable_profiling,
+)
 from torchtitan.train import Trainer
 
 
@@ -242,6 +251,70 @@ class FluxTrainer(Trainer):
             add_sampling_metadata=True,
             prompt=prompt,
         )
+
+    @record
+    def train(self):
+        job_config = self.job_config
+
+        self.checkpointer.load(step=job_config.checkpoint.load_step)
+        logger.info(
+            f"Gradient accumulation steps: {job_config.training.accumulate_steps}"
+        )
+        logger.info(f"Training starts at step {self.step + 1}.")
+
+        with (
+            maybe_enable_profiling(job_config, global_step=self.step) as torch_profiler,
+            maybe_enable_memory_snapshot(
+                job_config, global_step=self.step
+            ) as memory_profiler,
+            ft.maybe_semi_sync_training(
+                job_config,
+                ft_manager=self.ft_manager,
+                model=self.model_parts[0],
+                optimizer=self.optimizers,
+                sync_every=job_config.fault_tolerance.sync_steps,
+            ),
+        ):
+            data_iterator = iter(self.dataloader)
+            self.optimizers.zero_grad()
+            self.model_parts[0].set_requires_gradient_sync(False)
+            while self.step < job_config.training.steps:
+                self.step += 1
+                self.gc_handler.run(self.step)
+                try:
+                    self.train_step(
+                        data_iterator,
+                        acc_steps=self.job_config.training.accumulate_steps,
+                    )
+                except StopIteration:
+                    logger.info("No more data to train on")
+                    break
+                self.checkpointer.save(
+                    self.step, force=(self.step == job_config.training.steps)
+                )
+
+                # signal the profiler that the next profiling step has started
+                if torch_profiler:
+                    torch_profiler.step()
+                if memory_profiler:
+                    memory_profiler.step()
+
+                # reduce timeout after first train step for faster signal
+                # (assuming lazy init and compilation are finished)
+                if self.step == 1:
+                    dist_utils.set_pg_timeouts(
+                        timeout=timedelta(
+                            seconds=job_config.comm.train_timeout_seconds
+                        ),
+                        world_mesh=self.world_mesh,
+                    )
+
+        if torch.distributed.get_rank() == 0:
+            logger.info("Sleeping 2 seconds for other ranks to complete")
+            time.sleep(2)
+
+        self.metrics_processor.close()
+        logger.info("Training completed")
 
 
 if __name__ == "__main__":
